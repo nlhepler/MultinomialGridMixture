@@ -2,6 +2,7 @@
 
 using ArgParse
 using FastaIO
+using JSON
 
 const AMBIGS = Dict{String, Char}(
     [
@@ -16,7 +17,7 @@ const AMBIGS = Dict{String, Char}(
         'N'])
 
 function binom(n::Integer, k::Integer)
-    s = 0
+    s = 0.
     for i in 1:k
         s += log(n - (k - i)) - log(i)
     end
@@ -24,7 +25,7 @@ function binom(n::Integer, k::Integer)
 end
 
 function binom_sf(n::Integer, k::Integer, p::Float64)
-    t = 0
+    t = 0.
     for i in k:n
         t += binom(n, i) * p^i * (1 - p)^(n - i)
     end
@@ -89,24 +90,31 @@ function countmsa(msa::String, alphabet::String, do2d::Bool=false)
     return (counts, counts2d)
 end
 
-function rategrid(n::Integer)
+function rategrid(n::Integer, target_rate::Float64)
     update("generating rate grid .. ")
-    rates = 1 / (2 .^ linspace(2, 10, n))
-    rg = Array(Float64, (4 * length(rates) ^ 3, 4))
-    i = 1
+    rates = vcat(
+        1 / (2 .^ linspace(2, 10, div(n, 2))),
+        target_rate * logspace(log(10, 0.9), log(10, 1.1), div(n, 2)))
+    # rates = 1 / (2 .^ linspace(2, 10, n))
+    uniques = Set()
     for a in rates
         for b in rates
             for c in rates
                 M = 1 - (a + b + c)
-                rg[i    , :] = [M a b c]
-                rg[i + 1, :] = [a M b c]
-                rg[i + 2, :] = [a b M c]
-                rg[i + 3, :] = [a b c M]
-                i += 4
+                push!(uniques, [M a b c])
+                push!(uniques, [a M b c])
+                push!(uniques, [a b M c])
+                push!(uniques, [a b c M])    
             end
         end
     end
     done()
+    i = 1
+    rg = Array(Float64, (length(uniques), 4))
+    for r in uniques
+        rg[i, :] = r 
+        i += 1
+    end
     return rg
 end
 
@@ -114,7 +122,7 @@ lfact_cache = Float64[log(1)]
 
 function lfact(N::Integer)
     if N == 0
-        return 0.0
+        return 0.
     end
     n = length(lfact_cache)
     if n < N
@@ -127,7 +135,7 @@ function lfact(N::Integer)
 end
 
 function lmc(counts::Array{Int,2}, site::Int, nchars::Int)
-    c = 0.0
+    c = 0.
     s = 0
     for char in 1:nchars
         @inbounds c -= lfact(counts[site, char])
@@ -145,13 +153,14 @@ function gridscores(counts::Array{Int,2}, rates::Array{Float64,2}, alphabet::Str
     nsites, _ = size(counts)
     conditionals = Array(Float64, (npoints, nsites))
     scalers = Array(Float64, (nsites,))
+    log_rates = log(rates)
     for i in 1:nsites
-        m = realmin(Float64)
-        @inbounds c = lmc(counts, i, nchars)
+        m = -realmax(Float64)
+        c = lmc(counts, i, nchars)
         for j in 1:npoints
             s = c
             for k in 1:nchars
-                @inbounds s += counts[i, k] * log(rates[j, k])
+                @inbounds s += counts[i, k] * log_rates[j, k]
             end
             if s > m
                 m = s
@@ -177,7 +186,7 @@ function ldensity(weights::Array{Float64,2}, alpha::Float64)
         return 1e-10
     end
     if alpha == 1
-        return 0
+        return 0.
     end
     n = length(weights)
     r = lgamma(n * alpha) - n * lgamma(alpha)
@@ -213,7 +222,7 @@ function mcmc(
     weights = transpose((rand((npoints, 1)) .* (1.2 * sum_by_site - 0.8 * sum_by_site)) + 0.8 * sum_by_site)
     weights /= sum(weights)
 
-    stepsize = max(min(1 / npoints, 1 / nsites), median(weights))
+    stepsize = max(2. / max(npoints, nsites), median(weights))
 
     nsample = div(chain_length - nburnin, expected_nsamples)
     sampled_weights = zeros(Float64, (expected_nsamples, npoints))
@@ -225,7 +234,7 @@ function mcmc(
 
     step = 1
     accepted_steps = 0
-    mean_sampled_ll = 0
+    mean_sampled_ll = 0.
     sample_idx = 0
 
     diffvec = Array(Float64, (1, nsites))
@@ -247,7 +256,7 @@ function mcmc(
         @inbounds weights_j = weights[j]
 
         if weights_i > change
-            lldiff = 0
+            lldiff = 0.
             for k in 1:nsites
                 @inbounds diffvec[k] = (conditionals[j, k] - conditionals[i, k]) * change
                 @inbounds lldiff += log(current_site_likelihoods[k] + diffvec[k])
@@ -296,7 +305,7 @@ function loadrates()
     rates = Array(Float64, (nrates, 4))
     rates[:, 1:3] = rates3
     for i in 1:nrates
-        @inbounds rates[i, 4] = 1.0 - sum(rates[i, 1:3])
+        @inbounds rates[i, 4] = 1. - sum(rates[i, 1:3])
     end
     return rates
 end
@@ -316,35 +325,56 @@ function postproc(conditionals::Array{Float64,2}, scalers::Array{Float64,1}, wei
     # posteriors = normalization * (conditionals * diagm(priors[:, 1]))
     posteriors = zeros(Float64, (nsites, npoints))
     for i in 1:nsites
-        normalization = npoints * scalers[i] # normalization = 0 
+        normalization = 0.
         for j in 1:npoints
             @inbounds normalization += conditionals[i, j] * weights_priors[j]
         end
         for j in 1:npoints
-            @inbounds posteriors[i, j] = (conditionals[i, j] * weights_priors[j] + scalers[i]) / normalization
+            @inbounds posteriors[i, j] = (conditionals[i, j] * weights_priors[j]) / normalization
         end
     end
     done()
-    return posteriors
+    return (weights_priors, posteriors)
 end
 
 function callvariants(
         counts::Array{Int,2},
         counts2d::Union(Array{Int,4}, Nothing),
         rates::Array{Float64,2},
+        priors::Array{Float64,2},
         posteriors::Array{Float64,2},
         alphabet::String;
         target_rate::Float64=0.1,
-        posterior_threshold::Float64=0.999)
+        posterior_threshold::Float64=0.999,
+        json_file=nothing,
+        min_coverage::Int64=100)
 
     update("calling variants .. ")
+
     nsites, npoints = size(posteriors)
     nchars = length(alphabet)
+    posterior_means = posteriors * rates
     posterior_prob = posteriors * map(x -> x > target_rate, rates)
+
+    if json_file != nothing
+        overall_report = Dict()
+        rate_dict = Dict{Int64,Dict{String,Float64}}()
+        for i in 1:npoints
+            if priors[i] >= 0.5 / nsites
+                rate_dict[i] = (String=>Float64)[
+                        string(alphabet[j])=>rates[i, j] for j in 1:nchars]
+                rate_dict[i]["weight"] = priors[i]
+            end 
+        end
+        posterior_dict = Dict{Int64,Dict{String,Any}}()
+        overall_report["priors"] = rate_dict
+        consensus = ""
+    end
+
     variants = Dict{Int,String}()
+    
     if counts2d != nothing
         variants_ = Dict{Int,Set{Char}}()
-        expected_rates = posteriors * rates
         for i in keys(counts2d)
             for j in keys(counts2d[i])
                 n = 0
@@ -357,7 +387,7 @@ function callvariants(
                     for b in 1:nchars
                         k = counts2d[i][j][a, b]
                         if k > 0
-                            p = expected_rates[i] * expected_rates[j]
+                            p = posterior_means[i] * posterior_means[j]
                             t = binom_sf(n, k, p)
                             if t < 1 - posterior_threshold
                                 if !(i in variants_)
@@ -383,7 +413,7 @@ function callvariants(
         variants = Dict{Int, String}()
         for i in 1:nsites
             s = Set{Char}()
-            for j in 1:length(alphabet)
+            for j in 1:nchars
                 if posterior_prob[i, j] > posterior_threshold
                     push!(s, alphabet[j])
                 end
@@ -393,9 +423,31 @@ function callvariants(
                 println("$i: $s_,\t[$(join(counts[i, :], '\t'))]")
             end
             variants[i] = s_
+    
+            if json_file != nothing
+                if sum(counts[i,:]) >= min_coverage
+                    index = indmax(posterior_prob[i,:])
+                    consensus *= string(alphabet[index])
+                else
+                    consensus *= "-"
+                end
+                posterior_dict[i] = (String=>Any)[
+                    string(alphabet[j])=>[posterior_prob[i, j], posterior_means[i, j], counts[i, j]] for j in 1:nchars]
+                posterior_dict[i]["variants"] = s_
+            end
         end
-        done()
     end
+    
+    if json_file != nothing
+        overall_report["consensus"] = consensus
+        overall_report["posteriors"] = posterior_dict
+        open(json_file, "w") do json_out
+            JSON.print(json_out, overall_report)
+        end
+    end
+
+    done()
+    
     return variants
 end
 
@@ -419,7 +471,7 @@ function filterseqs(msa::String, variants::Dict{Int,String}, dest::String, alpha
                 seq_[j] = seq[j]
                 if v < length(sites) && j == sites[v]
                     idx = index(alphabet, seq[j])
-                    if idx > 0 && !varmask[v, idx]
+                    if idx > 0 && !varmask[v, idx] && variants[sites[v]] in keys(AMBIGS)
                         seq_[j] = AMBIGS[variants[sites[v]]]
                     end
                     v += 1
@@ -468,6 +520,8 @@ function main(args)
             default = 0.95
         "--filter", "-f"
             arg_type = String
+        "--json-report", "-j"
+            arg_type = String
         "msa"
             required = true
     end
@@ -475,10 +529,9 @@ function main(args)
     parsed_args = parse_args(args, s)
     const alphabet = "ACGT"
 
-    counts, counts2d = countmsa(parsed_args["msa"], alphabet, parsed_args["phase"])
+    rates = rategrid(parsed_args["grid-density"], parsed_args["target-rate"])
 
-    # rates = loadrates()
-    rates = rategrid(parsed_args["grid-density"])
+    counts, counts2d = countmsa(parsed_args["msa"], alphabet, parsed_args["phase"])
 
     conditionals, scalers = gridscores(counts, rates, alphabet)
 
@@ -486,11 +539,11 @@ function main(args)
         conditionals, scalers,
         chain_length=parsed_args["chain-length"], burnin_fraction=parsed_args["burnin-fraction"])
 
-    posteriors = postproc(conditionals', scalers, weights_samples)
+    priors, posteriors = postproc(conditionals', scalers, weights_samples)
 
     variants = callvariants(
-        counts, counts2d, rates, posteriors, alphabet,
-        target_rate=parsed_args["target-rate"], posterior_threshold=parsed_args["posterior-threshold"])
+        counts, counts2d, rates, priors, posteriors, alphabet,
+        target_rate=parsed_args["target-rate"], posterior_threshold=parsed_args["posterior-threshold"], json_file=parsed_args["json-report"])
 
     if "filter" in keys(parsed_args) && parsed_args["filter"] != nothing
         filterseqs(parsed_args["msa"], variants, parsed_args["filter"], alphabet)
