@@ -104,7 +104,7 @@ function rategrid(n::Integer, target_rate::Float64)
                 push!(uniques, [M a b c])
                 push!(uniques, [a M b c])
                 push!(uniques, [a b M c])
-                push!(uniques, [a b c M])    
+                push!(uniques, [a b c M])
             end
         end
     end
@@ -112,7 +112,7 @@ function rategrid(n::Integer, target_rate::Float64)
     i = 1
     rg = Array(Float64, (length(uniques), 4))
     for r in uniques
-        rg[i, :] = r 
+        rg[i, :] = r
         i += 1
     end
     return rg
@@ -364,7 +364,7 @@ function callvariants(
                 rate_dict[i] = (String=>Float64)[
                         string(alphabet[j])=>rates[i, j] for j in 1:nchars]
                 rate_dict[i]["weight"] = priors[i]
-            end 
+            end
         end
         posterior_dict = Dict{Int64,Dict{String,Any}}()
         overall_report["priors"] = rate_dict
@@ -372,7 +372,7 @@ function callvariants(
     end
 
     variants = Dict{Int,String}()
-    
+
     if counts2d != nothing
         variants_ = Dict{Int,Set{Char}}()
         for i in keys(counts2d)
@@ -423,7 +423,7 @@ function callvariants(
                 println("$i: $s_,\t[$(join(counts[i, :], '\t'))]")
             end
             variants[i] = s_
-    
+
             if json_file != nothing
                 if sum(counts[i,:]) >= min_coverage
                     index = indmax(posterior_prob[i,:])
@@ -437,7 +437,7 @@ function callvariants(
             end
         end
     end
-    
+
     if json_file != nothing
         overall_report["consensus"] = consensus
         overall_report["posteriors"] = posterior_dict
@@ -447,7 +447,7 @@ function callvariants(
     end
 
     done()
-    
+
     return variants
 end
 
