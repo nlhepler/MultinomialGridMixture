@@ -15,6 +15,22 @@ const AMBIGS = Dict{String, Char}(
         'V', 'H', 'D', 'B',
         'N'])
 
+function binom(n::Integer, k::Integer)
+    s = 0
+    for i in 1:k
+        s += log(n - (k - i)) - log(i)
+    end
+    exp(s)
+end
+
+function binom_sf(n::Integer, k::Integer, p::Float64)
+    t = 0
+    for i in k:n
+        t += binom(n, i) * p^i * (1 - p)^(n - i)
+    end
+    t
+end
+
 function index(s::String, c::Char)
     for i in 1:length(s)
         @inbounds s_i = s[i]
@@ -25,30 +41,52 @@ function index(s::String, c::Char)
     0
 end
 
-function countmsa(msa::String, alphabet::String)
+function countmsa(msa::String, alphabet::String, do2d::Bool=false)
     counts = nothing
+    counts2d = nothing
     ncols = 0
+    nchars = length(alphabet)
     tic()
     for (i, (name, seq)) in enumerate(FastaReader(msa))
         if counts == nothing
             ncols = length(seq)
-            counts = zeros(Int64, (ncols, 4))
+            counts = zeros(Int, (ncols, nchars))
         elseif length(seq) != ncols
             error("provided file is not an MSA! length($name) = $(length(seq)), not $ncols!")
         end
-        for j in 1:length(seq)
+        if do2d && counts2d == nothing
+            counts2d = Dict{Int,Dict{Int,Array{Int,2}}}
+        end
+        for j in 1:ncols
             @inbounds L = uppercase(seq[j])
-            for k in 1:length(alphabet)
-                @inbounds c = alphabet[k]
+            for a in 1:nchars
+                @inbounds c = alphabet[a]
                 if L == c
-                    counts[j, k] += 1
+                    counts[j, a] += 1
+                    if do2d && j < ncols
+                        for k in (j + 1):ncols
+                            @inbounds M = uppercase(seq[k])
+                            for b in 1:nchars
+                                @inbounds d = alphabet[b]
+                                if M == d
+                                    if !(j in counts2d)
+                                        counts2d[j] = Dict{Int,Array{Int,2}}()
+                                    end
+                                    if !(k in counts2d[j])
+                                        counts2d[j][k] = zeros(Int, (nchars, nchars))
+                                    end
+                                    counts2d[j][k][a, b] += 1
+                                end
+                            end
+                        end
+                    end
                 end
             end
         end
         progress("loading msa: read $i sequences .. ")
     end
     done()
-    counts
+    return (counts, counts2d)
 end
 
 function rategrid(n::Integer)
@@ -88,7 +126,7 @@ function lfact(N::Integer)
     @inbounds return lfact_cache[N]
 end
 
-function lmc(counts::Array{Int64,2}, site::Int64, nchars::Int64)
+function lmc(counts::Array{Int,2}, site::Int, nchars::Int)
     c = 0.0
     s = 0
     for char in 1:nchars
@@ -100,7 +138,7 @@ end
 
 const smin = log(realmin(Float64))
 
-function gridscores(counts::Array{Int64,2}, rates::Array{Float64,2}, alphabet::String)
+function gridscores(counts::Array{Int,2}, rates::Array{Float64,2}, alphabet::String)
     update("computing grid scores .. ")
     nchars = length(alphabet)
     npoints, _ = size(rates)
@@ -159,9 +197,9 @@ end
 function mcmc(
         conditionals::Array{Float64,2},
         scalers::Array{Float64,1};
-        chain_length::Int64=10_000_000,
+        chain_length::Int=10_000_000,
         burnin_fraction::Float64=0.5,
-        expected_nsamples::Int64=100,
+        expected_nsamples::Int=100,
         alpha::Float64=0.5)
 
     nburnin = iround(chain_length * burnin_fraction)
@@ -263,24 +301,36 @@ function loadrates()
     return rates
 end
 
-function postproc(conditionals::Array{Float64,2}, ws::Array{Float64,2})
+function postproc(conditionals::Array{Float64,2}, scalers::Array{Float64,1}, weights_samples::Array{Float64,2})
     update("computing posterior probabilities .. ")
     nsites, npoints = size(conditionals)
-    nsamples, _ = size(ws)
-    priors = zeros(Float64, (1, npoints))
+    nsamples, _ = size(weights_samples)
+    weights_priors = zeros(Float64, (npoints, 1))
     for i in 1:nsamples
-        @inbounds priors += ws[i, :]
+        for j in 1:npoints
+            @inbounds weights_priors[j] += weights_samples[i, j]
+        end
     end
-    priors = priors' / nsamples
-    priors /= sum(priors)
-    normalization = conditionals * priors
-    posteriors = ((1 / normalization) .* eye(nsites)) * (conditionals * (priors .* eye(npoints)))
+    weights_priors /= sum(weights_priors)
+    # normalization = diagm((1 / (conditionals * priors))[:, 1])
+    # posteriors = normalization * (conditionals * diagm(priors[:, 1]))
+    posteriors = zeros(Float64, (nsites, npoints))
+    for i in 1:nsites
+        normalization = npoints * scalers[i] # normalization = 0 
+        for j in 1:npoints
+            @inbounds normalization += conditionals[i, j] * weights_priors[j]
+        end
+        for j in 1:npoints
+            @inbounds posteriors[i, j] = (conditionals[i, j] * weights_priors[j] + scalers[i]) / normalization
+        end
+    end
     done()
     return posteriors
 end
 
 function callvariants(
-        counts::Array{Int64,2},
+        counts::Array{Int,2},
+        counts2d::Union(Array{Int,4}, Nothing),
         rates::Array{Float64,2},
         posteriors::Array{Float64,2},
         alphabet::String;
@@ -289,26 +339,67 @@ function callvariants(
 
     update("calling variants .. ")
     nsites, npoints = size(posteriors)
+    nchars = length(alphabet)
     posterior_prob = posteriors * map(x -> x > target_rate, rates)
-    variants = Dict{Int64,String}()
-    for i in 1:nsites
-        s = Set{Char}()
-        for j in 1:length(alphabet)
-            if posterior_prob[i, j] > posterior_threshold
-                push!(s, alphabet[j])
+    variants = Dict{Int,String}()
+    if counts2d != nothing
+        variants_ = Dict{Int,Set{Char}}()
+        expected_rates = posteriors * rates
+        for i in keys(counts2d)
+            for j in keys(counts2d[i])
+                n = 0
+                for a in keys(counts2d[i][j])
+                    for b in keys(counts2d[i][j][a])
+                        n += counts2d[i][j][a, b]
+                    end
+                end
+                for a in 1:nchars
+                    for b in 1:nchars
+                        k = counts2d[i][j][a, b]
+                        if k > 0
+                            p = expected_rates[i] * expected_rates[j]
+                            t = binom_sf(n, k, p)
+                            if t < 1 - posterior_threshold
+                                if !(i in variants_)
+                                    variants_[i] = Set{Char}(alphabet[a])
+                                else
+                                    push!(variants_[i], alphabet[a])
+                                end
+                                if !(j in variants_)
+                                    variants_[j] = Set{Char}(alphabet[b])
+                                else
+                                    push!(variants_[j], alphabet[b])
+                                end
+                            end
+                        end
+                    end
+                end
             end
         end
-        s_ = join(sort!(collect(s)))
-        if length(s) > 1
-            println("$i: $s_,\t[$(join(counts[i, :], '\t'))]")
+        for i in keys(variants_)
+            variants[i] = join(sort!(collect(variants_[i])))
         end
-        variants[i] = s_
+    else
+        variants = Dict{Int, String}()
+        for i in 1:nsites
+            s = Set{Char}()
+            for j in 1:length(alphabet)
+                if posterior_prob[i, j] > posterior_threshold
+                    push!(s, alphabet[j])
+                end
+            end
+            s_ = join(sort!(collect(s)))
+            if length(s) > 1
+                println("$i: $s_,\t[$(join(counts[i, :], '\t'))]")
+            end
+            variants[i] = s_
+        end
+        done()
     end
-    done()
     return variants
 end
 
-function filterseqs(msa::String, variants::Dict{Int64,String}, dest::String, alphabet::String)
+function filterseqs(msa::String, variants::Dict{Int,String}, dest::String, alphabet::String)
     tic()
     sites = sort!(collect(keys(variants)))
     varmask = zeros(Bool, ((length(variants), 4)))
@@ -358,19 +449,21 @@ function main(args)
     s.description = "call variants using a multinomial model sampled by MCMC"
 
     @add_arg_table s begin
+        "--phase", "-p"
+            action = :store_true
         "--grid-density", "-g"
-            arg_type = Int64
+            arg_type = Int
             default = 14
         "--chain-length", "-c"
-            arg_type = Int64
+            arg_type = Int
             default = 2_000_000
         "--burnin-fraction", "-b"
             arg_type = Float64
             default = 0.5
-        "--target-rate", "-t"
+        "--target-rate", "-r"
             arg_type = Float64
             default = 0.01
-        "--posterior-threshold", "-p"
+        "--posterior-threshold", "-t"
             arg_type = Float64
             default = 0.95
         "--filter", "-f"
@@ -382,24 +475,24 @@ function main(args)
     parsed_args = parse_args(args, s)
     const alphabet = "ACGT"
 
-    counts = countmsa(parsed_args["msa"], alphabet)
+    counts, counts2d = countmsa(parsed_args["msa"], alphabet, parsed_args["phase"])
 
     # rates = loadrates()
     rates = rategrid(parsed_args["grid-density"])
 
     conditionals, scalers = gridscores(counts, rates, alphabet)
 
-    lls, ws = mcmc(
+    lls, weights_samples = mcmc(
         conditionals, scalers,
         chain_length=parsed_args["chain-length"], burnin_fraction=parsed_args["burnin-fraction"])
 
-    posteriors = postproc(conditionals', ws)
+    posteriors = postproc(conditionals', scalers, weights_samples)
 
     variants = callvariants(
-        counts, rates, posteriors, alphabet,
+        counts, counts2d, rates, posteriors, alphabet,
         target_rate=parsed_args["target-rate"], posterior_threshold=parsed_args["posterior-threshold"])
 
-    if "filter" in keys(parsed_args)
+    if "filter" in keys(parsed_args) && parsed_args["filter"] != nothing
         filterseqs(parsed_args["msa"], variants, parsed_args["filter"], alphabet)
     end
 end
